@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/31051410/README.md)# macOS Hardening Baseline — MacBook Pro M2
+macOS Hardening Baseline — MacBook Pro M2
 
 Hardening the highest-value machine in my home lab: my daily driver. This MacBook runs my VMware Fusion attack/target lab, holds the only SSH private key to my internet-exposed Wazuh SIEM VPS, and handles everything else I do. If this machine gets compromised, everything downstream goes with it. That made it the right target for a baseline → remediate → verify project.
 
