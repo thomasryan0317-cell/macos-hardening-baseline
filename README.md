@@ -1,4 +1,4 @@
-# macOS Hardening Baseline — MacBook Pro M2
+[README.md](https://github.com/user-attachments/files/31051410/README.md)# macOS Hardening Baseline — MacBook Pro M2
 
 Hardening the highest-value machine in my home lab: my daily driver. This MacBook runs my VMware Fusion attack/target lab, holds the only SSH private key to my internet-exposed Wazuh SIEM VPS, and handles everything else I do. If this machine gets compromised, everything downstream goes with it. That made it the right target for a baseline → remediate → verify project.
 
@@ -59,24 +59,29 @@ After enabling the firewall I immediately re-tested what it could have broken: K
 
 ## Phase 4 — Verification from the attacker's side
 
-From the Kali VM, a full 65,535-port scan against the hardened Mac was abandoned after hours at 7% — with stealth mode silently dropping every probe, each port has to fully time out. The scan being that expensive is itself the result.
+My first verification pass from the Kali VM looked like a clean sweep: a targeted nmap scan reported every port filtered with no response, and a ping test showed 100% loss. I threw out the ping result immediately — the errors originated from the VM's NAT gateway, not the target, and a control ping against my router also failed. What I didn't catch until the next day: the NAT path was *completely dead* (the VM couldn't reach its own gateway), which invalidated the nmap results too. Against a silently-dropping firewall, "no response" and "my packets never left a broken network" produce identical output.
 
-A targeted scan of ~1,000 common ports plus every port from this project's story:
+So I redid verification properly, positive control first — prove the probe path can succeed before trusting any negative result:
+
+![Positive control — curl from Kali reaches the internet before scanning](screenshots/curl-control.png)
+
+Then the scan, over a proven-live path:
+
+![Validated scan — 1,027 filtered, rapportd's port open](screenshots/nmap-validated.png)
 
 ```
-Nmap scan report for <MAC_LAN_IP>
-Host is up.
-All 1028 scanned ports on <MAC_LAN_IP> are in ignored states.
-Not shown: 1028 filtered tcp ports (no-response)
+Host is up (0.0089s latency).
+Not shown: 1027 filtered tcp ports (no-response)
+PORT      STATE SERVICE
+49152/tcp open  unknown
 ```
 
-![Targeted nmap scan — all 1,028 ports filtered, no response](screenshots/nmap-filtered.png)
+Two results, both real:
 
-Ports 5000 and 7000 — open at baseline — now give no response. So does 49152, the port belonging to rapportd, the service I kept: still running, invisible to unsolicited probes.
+- **Ports 5000 and 7000 — open at baseline — are gone.** The AirPlay remediation held under a valid scan, along with everything else stealth mode drops.
+- **Port 49152 (rapportd) is open and reachable.** The invalid scan had shown it filtered; the valid one exposed the truth. The application firewall's default setting "automatically allow built-in software to receive incoming connections" waves Apple-signed services like rapportd through, so keeping AirDrop means this port answers. That's a real trade-off, and it's now documented accurately under Accepted Risks instead of hidden by bad evidence.
 
-An ICMP (ping) test came back 100% loss, but I didn't count it: the errors said `Destination Host Unreachable` from the Kali VM's own NAT gateway, so I ran a control ping against my router — also unreachable. VMware's NAT was passing TCP but dropping ICMP, which made the ping test invalid from that vantage point, not passed. The TCP scan carries the proof on its own.
-
-![The ping test that got thrown out — errors originate from the NAT gateway, not the target](screenshots/ping-invalidated.png)
+The invalidated first scan didn't just weaken my evidence — it had concealed a true positive. Re-verification found a finding.
 
 Lynis rescan: **hardening index 78** (from 75).
 
@@ -88,21 +93,24 @@ Lynis rescan: **hardening index 78** (from 75).
 
 **The mystery port 8021 and launchd socket activation.** An unknown listener on `127.0.0.1:8021` showed as owned by `launchd` (PID 1). macOS uses socket activation: launchd holds sockets on behalf of on-demand services and only spawns them if a connection arrives — so `lsof` names the janitor, not the tenant. Grepping the LaunchDaemons plists for `8021` pointed at `com.apple.ftp-proxy` (with two false positives from 802.1X services — worth understanding why a grep matched before trusting it). Final attribution came by experiment: `launchctl bootout` of ftp-proxy, and the 8021 socket vanished on the next `lsof`. The mystery listener and the Lynis ftp-proxy finding were the same finding.
 
-**The disable that reverted.** `launchctl disable` on ftp-proxy was verified, then found flipped back to enabled after rebooting into the 26.6.1 update. The most likely cause is the OS update rebuilding launchd's service overrides — notably `com.apple.ftpd` stayed disabled, but that's Apple's shipped default rather than my override, which fits the update-restore theory. Re-disabled post-update; persistence across the next normal reboot to be confirmed. Broader lesson, which this project taught me three separate times: `disable` is a promise about the future, `bootout` is an action in the present, and `lsof` is the only vote that counts. Config, policy, and effective state are three different layers — check the one that matters.
+**The disable that reverted — twice.** `launchctl disable` on ftp-proxy was verified, then found flipped back to enabled after rebooting into the 26.6.1 update. I suspected the update had rebuilt launchd's overrides, re-disabled it, and waited for the next normal reboot. It reverted again — no update involved. Reading the override record directly (`/var/db/com.apple.xpc.launchd/disabled.plist`) showed the file and launchd agreed with each other: my disable entry had been rewritten to enabled at boot. The override simply does not persist for this sealed-system service on this build. Since the socket is loopback-only and externally unreachable, I stopped fighting the platform and documented it as an accepted behavior instead. Broader lesson, which this project taught me repeatedly: `disable` is a promise about the future, `bootout` is an action in the present, and `lsof` is the only vote that counts. Config, policy, and effective state are three different layers — check the one that matters.
 
-**The ping test I threw out.** A 100% packet loss result looked like a stealth-mode win until I read where the errors originated. A control test against a known-good target invalidated my own evidence. Before trusting a negative result, prove the probe can succeed against something.
+**The verification I had to redo.** My first ping test showed 100% loss — a stealth-mode "win" until I read where the errors came from (the VM's own NAT gateway) and ran a control ping that failed too. I threw the ping out but kept the nmap results from the same session. That was the mistake: when the lab's NAT later died completely and got fixed with a reboot, re-scanning over a proven-live path (curl control first) showed a port the "all filtered" scan had missed — rapportd, genuinely open. A negative result without a positive control isn't evidence; silence from a firewall and silence from a dead network are the same silence. The re-done verification also produced the project's most interesting finding, which the broken one had hidden.
+
+![The ping test that started the unraveling — errors originate from the NAT gateway, not the target](screenshots/ping-invalidated.png)
 
 **The scanner that reads comments as usernames.** Lynis kept flagging home-directory permissions after my fix. The log showed why: it parses `/etc/passwd` line-by-line like a Linux box — on macOS that file is only consulted in single-user mode (real accounts live in Open Directory), and Lynis was literally "checking" the comment lines explaining that. The actual residual flag was `/var/spool/uucp`, the home of a legacy UUCP service account — my directory had passed. Tightened it to 750 anyway as scanner hygiene, not as a security win. Lesson: a finding that persists after remediation is a question, not a verdict — read the log to learn whether you missed, or the scanner did.
 
 ## Accepted Risks & Out of Scope
 
-- **rapportd (AirDrop/Handoff) retained.** I occasionally AirDrop with my phone. Exposure is mitigated three ways: AirDrop restricted to Contacts Only, stealth mode drops unsolicited probes (verified — its port returned no-response in the Kali scan), and the realistic threat requires an attacker already on my LAN. Turning it off would trade a real workflow for near-zero marginal gain.
+- **rapportd (AirDrop/Handoff) retained — its port is network-reachable.** The validated scan shows 49152/tcp open: the application firewall automatically allows Apple-signed built-in software, so keeping AirDrop means this service answers on the LAN. Mitigations are at other layers: AirDrop restricted to Contacts Only (application-layer auth), and the exposure requires an attacker already on my home network. That trade — one authenticated Apple service reachable, in exchange for a workflow I use — is accepted with eyes open, not hidden behind a scan that said otherwise.
 - **`/Users/Shared` world-writable.** Ships that way, with the sticky bit — same semantics as `/tmp`. Expected default, no action.
 - **No MDM, no third-party EDR.** Personal machine; enterprise controls are out of scope here.
-- **ftp-proxy disable persistence** pending confirmation across the next normal reboot (see Challenges).
+- **ftp-proxy re-enables itself at boot.** The launchd override record is rewritten to enabled on restart (verified twice, including once with no OS update involved). Loopback-only socket, unreachable externally — accepted and documented rather than fought.
 
 ## Future Work
 
-- Confirm ftp-proxy disable persistence; if it reverts again without an update involved, investigate what re-asserts it
+- Decide on the firewall's "automatically allow built-in software" setting: disabling it would close rapportd's port but break AirDrop receiving — revisit if the AirDrop workflow stops earning its exposure
 - Scan this hardened machine with Nessus Essentials (next project) — scan/fix/rescan against a real target
 - Periodic re-baseline: re-run the `lsof` capture and Lynis after macOS point updates, since updates can change service state (this project caught one doing exactly that)
+- Re-verify externally after any change, positive control first — this project's re-scan found what the first scan missed
